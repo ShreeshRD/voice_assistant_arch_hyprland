@@ -13,12 +13,52 @@ use std::collections::HashMap;
 /// Writes samples directly into AppState's shared buffer.
 pub fn record_audio(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or("No input device available")?;
+    let config_device_name = {
+        let state = app.state::<AppState>();
+        let config = state.config.lock().unwrap();
+        config.input_device.clone()
+    };
+    
+    let devices = host.input_devices()?.collect::<Vec<_>>();
+    println!("--- Audio Device Probe ---");
+    
+    // If the user hasn't selected a specific device yet, or we want to help them find it,
+    // let's log the names clearly.
+    for (i, d) in devices.iter().enumerate() {
+        let name = d.name().unwrap_or_else(|_| "Unknown".into());
+        println!("Device {}: {}", i, name);
+    }
+
+    // Try to find the device from config, otherwise use our heuristic
+    let device = if !config_device_name.is_empty() && config_device_name != "default" {
+        devices.iter().find(|d| d.name().ok() == Some(config_device_name.clone()))
+            .cloned()
+            .or_else(|| host.default_input_device())
+    } else {
+        // Heuristic: look for hardware-like names and avoid virtual/monitor sinks
+        devices.iter().find(|d| {
+            if let Ok(name) = d.name() {
+                let nl = name.to_lowercase();
+                (nl.contains("mic") || nl.contains("input") || nl.contains("usb") || nl.contains("audio") || 
+                 nl.contains("sof") || nl.contains("hda") || nl.contains("card") || nl.contains("hw:"))
+                && !nl.contains("monitor") && !nl.contains("output") && !nl.contains("pipewire") && !nl.contains("pulse")
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .or_else(|| host.default_input_device())
+    }.ok_or("No suitable input device found.")?;
+
+    let name = device.name().unwrap_or_else(|_| "Unknown".into());
+    println!("Active recording device: {}", name);
 
     let config = device.default_input_config()?;
     let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as usize;
+    let format = config.sample_format();
+
+    println!("Stream config: {}Hz, {} channels, {:?}", sample_rate, channels, format);
 
     // Store sample rate in state
     {
@@ -27,15 +67,39 @@ pub fn record_audio(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     }
 
     let app_clone = app.clone();
+    let peak_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let peak_atomic_clone = peak_atomic.clone();
 
-    let stream = match config.sample_format() {
+    let stream = match format {
         cpal::SampleFormat::F32 => {
             let app_ref = app.clone();
+            let peak_ref = peak_atomic_clone.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let state = app_ref.state::<AppState>();
-                    state.recorded_samples.lock().unwrap().extend_from_slice(data);
+                    let mut samples = state.recorded_samples.lock().unwrap();
+                    let mut local_peak = 0.0f32;
+                    
+                    if channels == 1 {
+                        for &s in data {
+                            if s.abs() > local_peak { local_peak = s.abs(); }
+                            samples.push(s);
+                        }
+                    } else {
+                        for frame in data.chunks_exact(channels) {
+                            let val = frame[0];
+                            if val.abs() > local_peak { local_peak = val.abs(); }
+                            samples.push(val);
+                        }
+                    }
+
+                    // Update global peak (stored as bits to be atomic)
+                    let current_peak_bits = peak_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let current_peak = f32::from_bits(current_peak_bits);
+                    if local_peak > current_peak {
+                        peak_ref.store(local_peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
                 None,
@@ -43,36 +107,69 @@ pub fn record_audio(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
         }
         cpal::SampleFormat::I16 => {
             let app_ref = app.clone();
+            let peak_ref = peak_atomic_clone.clone();
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let floats: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let state = app_ref.state::<AppState>();
-                    state.recorded_samples.lock().unwrap().extend_from_slice(&floats);
+                    let mut samples = state.recorded_samples.lock().unwrap();
+                    let mut local_peak = 0.0f32;
+
+                    if channels == 1 {
+                        for &s in data {
+                            let f = s as f32 / 32768.0;
+                            if f.abs() > local_peak { local_peak = f.abs(); }
+                            samples.push(f);
+                        }
+                    } else {
+                        for frame in data.chunks_exact(channels) {
+                            let f = frame[0] as f32 / 32768.0;
+                            if f.abs() > local_peak { local_peak = f.abs(); }
+                            samples.push(f);
+                        }
+                    }
+
+                    let current_peak_bits = peak_ref.load(std::sync::atomic::Ordering::Relaxed);
+                    let current_peak = f32::from_bits(current_peak_bits);
+                    if local_peak > current_peak {
+                        peak_ref.store(local_peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
                 None,
             )?
         }
-        format => {
-            return Err(format!("Unsupported sample format: {:?}", format).into());
-        }
+        f => return Err(format!("Unsupported sample format: {:?}", f).into()),
     };
 
     stream.play()?;
-
-    // Spin until recording is stopped
-    loop {
-        let is_rec = *app_clone.state::<AppState>().is_recording.lock().unwrap();
-        if !is_rec {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    
+    // Monitor loop
+    while *app_clone.state::<AppState>().is_recording.lock().unwrap() {
+        let p_bits = peak_atomic.load(std::sync::atomic::Ordering::Relaxed);
+        let p = f32::from_bits(p_bits);
+        // Print a simple level meter in console
+        let bars = (p * 50.0) as usize;
+        let meter = "|".repeat(bars.min(50));
+        print!("\rLevel: [{:<50}] {:.4}", meter, p);
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    println!();
 
-    // Stream drops here, stopping recording
+    let state = app_clone.state::<AppState>();
+    let samples = state.recorded_samples.lock().unwrap();
+    let count = samples.len();
+    let final_peak_bits = peak_atomic.load(std::sync::atomic::Ordering::Relaxed);
+    let final_peak = f32::from_bits(final_peak_bits);
+    println!("Recording finished. Collected {} samples. Max peak: {:.4}", count, final_peak);
+
+    drop(stream);
     Ok(())
 }
+
 
 // ── Whisper Transcription (native) ──
 
@@ -103,11 +200,13 @@ pub fn transcribe_audio(
 
     state.full(params, &audio_16k)?;
 
-    let num_segments = state.full_n_segments()?;
+    let num_segments = state.full_n_segments();
     let mut text = String::new();
     for i in 0..num_segments {
-        if let Ok(segment) = state.full_get_segment_text(i) {
-            text.push_str(&segment);
+        if let Some(segment) = state.get_segment(i) {
+            if let Ok(segment_text) = segment.to_str() {
+                text.push_str(segment_text);
+            }
         }
     }
 

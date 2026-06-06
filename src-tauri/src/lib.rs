@@ -99,6 +99,8 @@ pub struct VoiceConfig {
     pub chatterbox_voice: String,
     pub system_prompt: String,
     #[serde(default)]
+    pub input_device: String,
+    #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
     pub sandbox: sandbox::SandboxConfig,
@@ -122,6 +124,7 @@ impl Default for VoiceConfig {
             chatterbox_url: "http://localhost:8005".to_string(),
             chatterbox_voice: "Anirban.wav".to_string(),
             system_prompt: "You are a voice assistant running on the user's desktop. The conversation happens entirely through voice — the user speaks into their microphone, their speech is transcribed to text via Whisper (STT), sent to you as a message, and your response is converted back to speech via Chatterbox Turbo (TTS) and played through their speakers. You can hear them and they can hear you — treat this as a natural spoken conversation. If they ask \"can you hear me\" the answer is yes.\n\nKeep responses concise and conversational — 2-3 sentences max. No markdown, no code blocks, no bullet points, no numbered lists, no special formatting. Write exactly as you would speak out loud. Avoid colons in your responses as they cause unnatural pauses in TTS.\n\nYou can express emotions naturally using these paralinguistic tags inline with your speech — use them sparingly and only when they genuinely fit the moment:\n[laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush]\nExample — \"Oh wow, that's actually hilarious [laugh] I didn't expect that at all.\"\nDo NOT overuse them. Most responses need zero tags. Only use them when a human would genuinely make that sound.\n\nWhen you decide to use a tool, ALWAYS say what you're about to do first in a short natural sentence before calling the tool. For example — \"Let me take a look at your screen\" before taking a screenshot, \"Let me search the web for that\" before fetching a page, \"Let me check the time\" before getting the time, \"One sec, let me run that command\" before executing a shell command. This way the user hears what's happening instead of waiting in silence.".to_string(),
+            input_device: "default".to_string(),
             tools: ToolsConfig::default(),
             sandbox: sandbox::SandboxConfig::default(),
         }
@@ -173,6 +176,14 @@ fn set_config(state: tauri::State<AppState>, config: VoiceConfig) {
 #[tauri::command]
 fn get_messages(state: tauri::State<AppState>) -> Vec<ChatMessage> {
     state.messages.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_input_devices() -> Result<Vec<String>, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let devices = host.input_devices().map_err(|e| e.to_string())?;
+    Ok(devices.filter_map(|d| d.name().ok()).collect())
 }
 
 #[tauri::command]
@@ -871,6 +882,7 @@ pub fn run() {
             get_config,
             set_config,
             get_messages,
+            get_input_devices,
             clear_messages,
             show_window,
             hide_window,

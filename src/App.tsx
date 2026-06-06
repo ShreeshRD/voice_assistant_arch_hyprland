@@ -37,6 +37,7 @@ interface VoiceConfig {
   chatterbox_url: string;
   chatterbox_voice: string;
   system_prompt: string;
+  input_device: string;
   tools: ToolsConfig;
   sandbox: SandboxConfig;
 }
@@ -70,8 +71,29 @@ const TOOL_LABEL_MAP: Record<string, string> = {
 /* ─────────────────────────── Settings: Config Tab ─────────────────────────── */
 
 function ConfigTab({ config, setConfig }: { config: VoiceConfig; setConfig: (c: VoiceConfig) => void }) {
+  const [devices, setDevices] = useState<string[]>([]);
+
+  useEffect(() => {
+    invoke<string[]>("get_input_devices").then(setDevices).catch(console.error);
+  }, []);
+
   return (
     <div className="flex flex-col gap-5 p-5 px-6">
+      <FieldGroup title="Audio Settings">
+        <Field label="Microphone">
+          <select
+            value={config.input_device}
+            onChange={(e) => setConfig({ ...config, input_device: e.target.value })}
+            className="w-full bg-white/[0.05] border border-white/10 text-white/90 px-3 py-2.5 rounded-lg text-[13px] outline-none transition-all duration-200 focus:border-blue-500/50 focus:bg-white/[0.07] appearance-none"
+          >
+            <option value="default" className="bg-[#1a1a2e]">Default Device</option>
+            {devices.map((d) => (
+              <option key={d} value={d} className="bg-[#1a1a2e]">{d}</option>
+            ))}
+          </select>
+        </Field>
+      </FieldGroup>
+
       <FieldGroup title="Speech Recognition">
         <Field label="Whisper Model Path">
           <Input value={config.whisper_model_path} onChange={(v) => setConfig({ ...config, whisper_model_path: v })} />
@@ -669,7 +691,17 @@ function Orb() {
 
       {/* Orb */}
       <div className="flex justify-center pb-5 pt-2 shrink-0">
-        <div className={`${orbClass} relative w-20 h-20`}>
+        <div
+          className={`${orbClass} relative w-20 h-20 cursor-pointer`}
+          onMouseDown={() => {
+            invoke("start_recording");
+            setStage("listening");
+          }}
+          onMouseUp={() => {
+            invoke("stop_recording_and_process");
+            setStage("transcribing");
+          }}
+        >
           <div className={`orb-glow absolute -inset-[5%] rounded-full blur-[14px] z-[1] ${glowAnim}`} />
           <div className="orb-core absolute inset-[18%] rounded-full z-[2]" />
           <div className={`orb-ring absolute inset-[8%] rounded-full border-[1.5px] z-[3] ${ringAnim}`} />

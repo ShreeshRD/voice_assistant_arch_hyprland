@@ -86,6 +86,7 @@
 /* Main orb window background — full tint, only the border pixels fade to transparent */
 .orb-bg {
   background: rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
   -webkit-mask-image:
     linear-gradient(to right,  transparent 0%, black 18%, black 82%, transparent 100%),
     linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%);
