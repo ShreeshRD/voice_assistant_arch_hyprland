@@ -557,6 +557,13 @@ async fn process_pipeline(
         match tts_result {
             Ok(audio_base64) => {
                 if cancel.is_cancelled() { break; }
+                
+                // In your application logic execution flow:
+                // You MUST feed the base64 string to the player
+                if let Err(err) = voice::play_synthesized_audio(&audio_base64) {
+                    eprintln!("Production audio output error: {}", err);
+                }
+
                 app.emit("play_audio_chunk", AudioChunk {
                     index: sentence_index,
                     audio: audio_base64,
@@ -565,7 +572,7 @@ async fn process_pipeline(
                 sentence_index += 1;
             }
             Err(e) => {
-                eprintln!("TTS failed for sentence: {}", e);
+                eprintln!("Synthesis pipeline failed: {}", e);
             }
         }
     }

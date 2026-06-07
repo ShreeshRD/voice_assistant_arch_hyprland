@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 use std::collections::HashMap;
 
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+
 // ── Audio Recording (cpal) ──
 
 /// Record audio on the current thread until `is_recording` is set to false.
@@ -749,25 +752,29 @@ struct ChatterboxRequest {
     model: String,
 }
 
+/// 1. Synthesizes text to a clean Base64 encoded string (No Data URI prefix, matching the test pattern)
 pub async fn synthesize(
     config: &VoiceConfig,
     text: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!("[Chatterbox] Starting synthesis workflow...");
+    
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
+    let selected_voice = if config.chatterbox_voice.is_empty() {
+        "Andy".to_string()
+    } else {
+        config.chatterbox_voice.clone()
+    };
+
     let request = ChatterboxRequest {
         input: text.to_string(),
-        voice: if config.chatterbox_voice.is_empty() {
-            "Andy".to_string()
-        } else {
-            config.chatterbox_voice.clone()
-        },
+        voice: selected_voice,
         model: "chatterbox".to_string(),
     };
 
-    // Ensure URL structure handles slash joins cleanly
     let base_url = config.chatterbox_url.trim_end_matches('/');
     let target_url = format!("{}/v1/audio/speech", base_url);
 
@@ -779,18 +786,102 @@ pub async fn synthesize(
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_else(|_| "Unknown empty error body".to_string());
+        let body = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         return Err(format!("Chatterbox API error {}: {}", status, body).into());
     }
 
     let audio_bytes = resp.bytes().await?;
-    
     if audio_bytes.is_empty() {
         return Err("Chatterbox returned an empty byte array buffer.".into());
     }
 
-    // Safely encode binary audio bytes into Base64 for the frontend player
-    Ok(STANDARD.encode(&audio_bytes))
+    // Return the clean Base64 string that matches the test expectation
+    let encoded_string = STANDARD.encode(&audio_bytes);
+    println!("[Chatterbox] Base64 encoding complete. Final length: {} chars.", encoded_string.len());
+    
+    Ok(encoded_string)
+}
+
+/// 2. Production Audio Player
+/// Pass the Base64 string directly into this function in your production pipeline.
+pub fn play_synthesized_audio(base64_audio: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[AudioPlayer] Decoding Base64 string back to raw WAV bytes...");
+    
+    // If the string somehow got prefixed with a Data URI header, strip it out dynamically
+    let clean_b64 = if base64_audio.contains(",") {
+        base64_audio.split(',').nth(1).unwrap_or(base64_audio)
+    } else {
+        base64_audio
+    };
+
+    let audio_bytes = STANDARD.decode(clean_b64)
+        .map_err(|e| format!("Base64 decoding failed: {}", e))?;
+    
+    println!("[AudioPlayer] Successfully decoded {} raw bytes. Initializing cpal audio device...", audio_bytes.len());
+
+    let mut reader = hound::WavReader::new(Cursor::new(audio_bytes))
+        .map_err(|e| format!("Invalid WAV format metadata: {}", e))?;
+    
+    let spec = reader.spec();
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or("No default output audio device found")?;
+    let config = device.default_output_config()?;
+    
+    let target_sample_rate = config.sample_rate().0 as f32;
+    let source_sample_rate = spec.sample_rate as f32;
+    let output_channels = config.channels() as usize;
+
+    // Collect all audio samples into memory
+    let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+    let samples = Arc::new(samples);
+    let pos_f = Arc::new(Mutex::new(0.0f32));
+    
+    let pos_clone = Arc::clone(&pos_f);
+    let samples_clone = Arc::clone(&samples);
+    let ratio = source_sample_rate / target_sample_rate;
+    
+    println!("[AudioPlayer] Resampling audio track: {}Hz -> {}Hz", source_sample_rate, target_sample_rate);
+
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let mut p = pos_clone.lock().unwrap();
+            for frame in data.chunks_mut(output_channels) {
+                let idx = *p as usize;
+                if idx < samples_clone.len() {
+                    let frac = *p - idx as f32;
+                    let s1 = samples_clone[idx] as f32 / 32768.0;
+                    let s2 = if idx + 1 < samples_clone.len() {
+                        samples_clone[idx + 1] as f32 / 32768.0
+                    } else {
+                        s1
+                    };
+                    let val = s1 * (1.0 - frac) + s2 * frac;
+                    
+                    for sample in frame.iter_mut() {
+                        *sample = val;
+                    }
+                    *p += ratio;
+                } else {
+                    for sample in frame.iter_mut() {
+                        *sample = 0.0;
+                    }
+                }
+            }
+        },
+        |err| eprintln!("[AudioPlayer Stream Error] {}", err),
+        None,
+    )?;
+
+    stream.play()?;
+    
+    // CRITICAL: Prevent the background thread from dropping the stream out of scope before completion
+    let duration_secs = (samples.len() as f32 / source_sample_rate) + 0.5;
+    println!("[AudioPlayer] Playback stream active. Sleeping thread for {:.2} seconds...", duration_secs);
+    std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
+    println!("[AudioPlayer] Playback execution track finished cleanly.");
+    
+    Ok(())
 }
 
 #[cfg(test)]
