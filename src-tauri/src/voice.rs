@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 use std::collections::HashMap;
 
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+
 // ── Audio Recording (cpal) ──
 
 /// Record audio on the current thread until `is_recording` is set to false.
@@ -307,6 +310,7 @@ struct OllamaStreamChunk {
 }
 
 /// Build tool definitions based on enabled tools in config.
+/// Tailored specifically for Arch Linux running Hyprland, zsh, and Zen Browser.
 pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> {
     let mut tools = Vec::new();
 
@@ -335,17 +339,13 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "take_screenshot",
-                "description": "Capture a screenshot of the user's screen and describe what is visible. Use this when the user asks what's on their screen, asks you to look at something, or wants help with something they're looking at. By default captures the active monitor (where the mouse cursor is).",
+                "description": "Capture a screenshot of the user's Hyprland environment using grim and wl-copy, then describe what is visible. Use this when the user asks what's on their screen, asks you to look at something, or wants help with something they're looking at.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": {
                             "type": "string",
                             "description": "What to look for or describe in the screenshot. Defaults to a general description."
-                        },
-                        "monitor": {
-                            "type": "integer",
-                            "description": "Which monitor to capture (1 = primary, 2 = secondary, etc). If omitted, captures the active monitor where the mouse cursor is."
                         }
                     }
                 }
@@ -358,7 +358,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "read_clipboard",
-                "description": "Read the current text contents of the user's clipboard. Use this when the user says they copied something, or asks about what's in their clipboard.",
+                "description": "Read the current text contents of the user's Wayland clipboard using wl-paste. Use this when the user says they copied something, or asks about what's in their clipboard.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -372,7 +372,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "open_url",
-                "description": "Open a URL in the user's default web browser. Use when the user asks to open a website, search something on the web, or navigate to a URL.",
+                "description": "Open a URL in the user's Zen Browser. Use when the user asks to open a website, search something on the web, or navigate to a URL.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -406,7 +406,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "list_running_apps",
-                "description": "List all currently running applications on the user's Mac. Use when the user asks what apps are open or running.",
+                "description": "List all currently open windows and application clients running in the user's Hyprland compositor session via `hyprctl clients`. Use when the user asks what apps are open, active, or running.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -440,7 +440,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Execute a shell command on the user's Mac and return its output. Use when the user asks to check system status, manage files, run scripts, install something, or perform any task that requires terminal access. Always prefer specific, minimal commands.",
+                "description": "Execute a shell command on the user's Arch Linux system and return its output. The underlying shell environment runs in zsh. Use when the user asks to check system status, manage files, run scripts, install packages via pacman/yay, or perform any task that requires terminal access. Always prefer specific, minimal commands.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -752,32 +752,238 @@ struct ChatterboxRequest {
     model: String,
 }
 
+/// 1. Synthesizes text to a clean Base64 encoded string (No Data URI prefix, matching the test pattern)
 pub async fn synthesize(
     config: &VoiceConfig,
     text: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    println!("[Chatterbox] Starting synthesis workflow...");
+    
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
+    let selected_voice = if config.chatterbox_voice.is_empty() {
+        "Andy".to_string()
+    } else {
+        config.chatterbox_voice.clone()
+    };
+
     let request = ChatterboxRequest {
         input: text.to_string(),
-        voice: config.chatterbox_voice.clone(),
+        voice: selected_voice,
         model: "chatterbox".to_string(),
     };
 
+    let base_url = config.chatterbox_url.trim_end_matches('/');
+    let target_url = format!("{}/v1/audio/speech", base_url);
+
     let resp = client
-        .post(format!("{}/v1/audio/speech", config.chatterbox_url))
+        .post(&target_url)
         .json(&request)
         .send()
         .await?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         return Err(format!("Chatterbox API error {}: {}", status, body).into());
     }
 
     let audio_bytes = resp.bytes().await?;
-    Ok(STANDARD.encode(&audio_bytes))
+    if audio_bytes.is_empty() {
+        return Err("Chatterbox returned an empty byte array buffer.".into());
+    }
+
+    // Return the clean Base64 string that matches the test expectation
+    let encoded_string = STANDARD.encode(&audio_bytes);
+    println!("[Chatterbox] Base64 encoding complete. Final length: {} chars.", encoded_string.len());
+    
+    Ok(encoded_string)
+}
+
+/// 2. Production Audio Player
+/// Pass the Base64 string directly into this function in your production pipeline.
+pub fn play_synthesized_audio(base64_audio: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[AudioPlayer] Decoding Base64 string back to raw WAV bytes...");
+    
+    // If the string somehow got prefixed with a Data URI header, strip it out dynamically
+    let clean_b64 = if base64_audio.contains(",") {
+        base64_audio.split(',').nth(1).unwrap_or(base64_audio)
+    } else {
+        base64_audio
+    };
+
+    let audio_bytes = STANDARD.decode(clean_b64)
+        .map_err(|e| format!("Base64 decoding failed: {}", e))?;
+    
+    println!("[AudioPlayer] Successfully decoded {} raw bytes. Initializing cpal audio device...", audio_bytes.len());
+
+    let mut reader = hound::WavReader::new(Cursor::new(audio_bytes))
+        .map_err(|e| format!("Invalid WAV format metadata: {}", e))?;
+    
+    let spec = reader.spec();
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or("No default output audio device found")?;
+    let config = device.default_output_config()?;
+    
+    let target_sample_rate = config.sample_rate().0 as f32;
+    let source_sample_rate = spec.sample_rate as f32;
+    let output_channels = config.channels() as usize;
+
+    // Collect all audio samples into memory
+    let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+    let samples = Arc::new(samples);
+    let pos_f = Arc::new(Mutex::new(0.0f32));
+    
+    let pos_clone = Arc::clone(&pos_f);
+    let samples_clone = Arc::clone(&samples);
+    let ratio = source_sample_rate / target_sample_rate;
+    
+    println!("[AudioPlayer] Resampling audio track: {}Hz -> {}Hz", source_sample_rate, target_sample_rate);
+
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let mut p = pos_clone.lock().unwrap();
+            for frame in data.chunks_mut(output_channels) {
+                let idx = *p as usize;
+                if idx < samples_clone.len() {
+                    let frac = *p - idx as f32;
+                    let s1 = samples_clone[idx] as f32 / 32768.0;
+                    let s2 = if idx + 1 < samples_clone.len() {
+                        samples_clone[idx + 1] as f32 / 32768.0
+                    } else {
+                        s1
+                    };
+                    let val = s1 * (1.0 - frac) + s2 * frac;
+                    
+                    for sample in frame.iter_mut() {
+                        *sample = val;
+                    }
+                    *p += ratio;
+                } else {
+                    for sample in frame.iter_mut() {
+                        *sample = 0.0;
+                    }
+                }
+            }
+        },
+        |err| eprintln!("[AudioPlayer Stream Error] {}", err),
+        None,
+    )?;
+
+    stream.play()?;
+    
+    // CRITICAL: Prevent the background thread from dropping the stream out of scope before completion
+    let duration_secs = (samples.len() as f32 / source_sample_rate) + 0.5;
+    println!("[AudioPlayer] Playback stream active. Sleeping thread for {:.2} seconds...", duration_secs);
+    std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
+    println!("[AudioPlayer] Playback execution track finished cleanly.");
+    
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VoiceConfig;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn test_chatterbox_synthesis() {
+        let config = VoiceConfig::default();
+        println!("Testing Chatterbox TTS at: {}", config.chatterbox_url);
+        println!("Using voice: {}", config.chatterbox_voice);
+        
+        match synthesize(&config, "Hello, I am testing the audio playback. Can you hear me?").await {
+            Ok(base64_audio) => {
+                println!("SUCCESS: Received {} bytes of base64 audio.", base64_audio.len());
+                
+                // Decode back to bytes
+                let audio_bytes = STANDARD.decode(base64_audio).unwrap();
+                
+                // Try to play it
+                println!("Attempting to play audio...");
+                if let Err(e) = play_wav_bytes(audio_bytes) {
+                    println!("Playback failed: {}", e);
+                } else {
+                    println!("Playback finished.");
+                }
+            }
+            Err(e) => {
+                println!("FAILURE: Chatterbox synthesis failed: {}", e);
+            }
+        }
+    }
+
+    fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
+        let spec = reader.spec();
+        println!("WAV Spec: {:?}", spec);
+
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or("No output device found")?;
+        let config = device.default_output_config()?;
+        let target_sample_rate = config.sample_rate().0 as f32;
+        let source_sample_rate = spec.sample_rate as f32;
+        let output_channels = config.channels() as usize;
+
+        println!("Resampling from {}Hz to {}Hz ({} output channels)", source_sample_rate, target_sample_rate, output_channels);
+
+        // Collect all samples into an Arc<Vec<i16>>
+        let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+        let samples = Arc::new(samples);
+        let pos_f = Arc::new(Mutex::new(0.0f32)); // Use float for sub-sample tracking
+
+        let pos_clone = Arc::clone(&pos_f);
+        let samples_clone = Arc::clone(&samples);
+        let ratio = source_sample_rate / target_sample_rate;
+        
+        let stream = device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut p = pos_clone.lock().unwrap();
+                // Process in frames (sets of channels)
+                for frame in data.chunks_mut(output_channels) {
+                    let idx = *p as usize;
+                    if idx < samples_clone.len() {
+                        // Simple linear interpolation
+                        let frac = *p - idx as f32;
+                        let s1 = samples_clone[idx] as f32 / 32768.0;
+                        let s2 = if idx + 1 < samples_clone.len() {
+                            samples_clone[idx + 1] as f32 / 32768.0
+                        } else {
+                            s1
+                        };
+                        let val = s1 * (1.0 - frac) + s2 * frac;
+                        
+                        // Fill all output channels with the same sample (mono to multi-channel)
+                        for sample in frame.iter_mut() {
+                            *sample = val;
+                        }
+                        
+                        // Advance source pointer only ONCE per output frame
+                        *p += ratio;
+                    } else {
+                        for sample in frame.iter_mut() {
+                            *sample = 0.0;
+                        }
+                    }
+                }
+            },
+            |err| eprintln!("Playback error: {}", err),
+            None,
+        )?;
+
+        stream.play()?;
+        
+        // Wait for audio to finish
+        let duration_secs = (samples.len() as f32 / source_sample_rate) + 0.5;
+        std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
+        
+        Ok(())
+    }
 }
