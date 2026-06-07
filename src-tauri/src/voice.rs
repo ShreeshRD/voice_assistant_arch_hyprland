@@ -836,26 +836,50 @@ mod tests {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("No output device found")?;
         let config = device.default_output_config()?;
+        let target_sample_rate = config.sample_rate().0 as f32;
+        let source_sample_rate = spec.sample_rate as f32;
+        let output_channels = config.channels() as usize;
 
-        // Collect all samples into an Arc<Vec<i16>> to share with the static-lifetime closure
+        println!("Resampling from {}Hz to {}Hz ({} output channels)", source_sample_rate, target_sample_rate, output_channels);
+
+        // Collect all samples into an Arc<Vec<i16>>
         let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
-        let total_samples = samples.len();
         let samples = Arc::new(samples);
-        let pos = Arc::new(Mutex::new(0usize));
+        let pos_f = Arc::new(Mutex::new(0.0f32)); // Use float for sub-sample tracking
 
-        let pos_clone = Arc::clone(&pos);
+        let pos_clone = Arc::clone(&pos_f);
         let samples_clone = Arc::clone(&samples);
+        let ratio = source_sample_rate / target_sample_rate;
         
         let stream = device.build_output_stream(
             &config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut p = pos_clone.lock().unwrap();
-                for sample in data.iter_mut() {
-                    if *p < samples_clone.len() {
-                        *sample = samples_clone[*p] as f32 / 32768.0;
-                        *p += 1;
+                // Process in frames (sets of channels)
+                for frame in data.chunks_mut(output_channels) {
+                    let idx = *p as usize;
+                    if idx < samples_clone.len() {
+                        // Simple linear interpolation
+                        let frac = *p - idx as f32;
+                        let s1 = samples_clone[idx] as f32 / 32768.0;
+                        let s2 = if idx + 1 < samples_clone.len() {
+                            samples_clone[idx + 1] as f32 / 32768.0
+                        } else {
+                            s1
+                        };
+                        let val = s1 * (1.0 - frac) + s2 * frac;
+                        
+                        // Fill all output channels with the same sample (mono to multi-channel)
+                        for sample in frame.iter_mut() {
+                            *sample = val;
+                        }
+                        
+                        // Advance source pointer only ONCE per output frame
+                        *p += ratio;
                     } else {
-                        *sample = 0.0;
+                        for sample in frame.iter_mut() {
+                            *sample = 0.0;
+                        }
                     }
                 }
             },
@@ -866,7 +890,7 @@ mod tests {
         stream.play()?;
         
         // Wait for audio to finish
-        let duration_secs = (total_samples as f32 / (spec.sample_rate as f32 * spec.channels as f32)) + 0.5;
+        let duration_secs = (samples.len() as f32 / source_sample_rate) + 0.5;
         std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
         
         Ok(())
