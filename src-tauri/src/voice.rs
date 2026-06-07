@@ -307,6 +307,7 @@ struct OllamaStreamChunk {
 }
 
 /// Build tool definitions based on enabled tools in config.
+/// Tailored specifically for Arch Linux running Hyprland, zsh, and Zen Browser.
 pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> {
     let mut tools = Vec::new();
 
@@ -335,17 +336,13 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "take_screenshot",
-                "description": "Capture a screenshot of the user's screen and describe what is visible. Use this when the user asks what's on their screen, asks you to look at something, or wants help with something they're looking at. By default captures the active monitor (where the mouse cursor is).",
+                "description": "Capture a screenshot of the user's Hyprland environment using grim and wl-copy, then describe what is visible. Use this when the user asks what's on their screen, asks you to look at something, or wants help with something they're looking at.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": {
                             "type": "string",
                             "description": "What to look for or describe in the screenshot. Defaults to a general description."
-                        },
-                        "monitor": {
-                            "type": "integer",
-                            "description": "Which monitor to capture (1 = primary, 2 = secondary, etc). If omitted, captures the active monitor where the mouse cursor is."
                         }
                     }
                 }
@@ -358,7 +355,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "read_clipboard",
-                "description": "Read the current text contents of the user's clipboard. Use this when the user says they copied something, or asks about what's in their clipboard.",
+                "description": "Read the current text contents of the user's Wayland clipboard using wl-paste. Use this when the user says they copied something, or asks about what's in their clipboard.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -372,7 +369,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "open_url",
-                "description": "Open a URL in the user's default web browser. Use when the user asks to open a website, search something on the web, or navigate to a URL.",
+                "description": "Open a URL in the user's Zen Browser. Use when the user asks to open a website, search something on the web, or navigate to a URL.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -406,7 +403,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "list_running_apps",
-                "description": "List all currently running applications on the user's Mac. Use when the user asks what apps are open or running.",
+                "description": "List all currently open windows and application clients running in the user's Hyprland compositor session via `hyprctl clients`. Use when the user asks what apps are open, active, or running.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -440,7 +437,7 @@ pub fn build_tools(tools_config: &crate::ToolsConfig) -> Vec<serde_json::Value> 
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Execute a shell command on the user's Mac and return its output. Use when the user asks to check system status, manage files, run scripts, install something, or perform any task that requires terminal access. Always prefer specific, minimal commands.",
+                "description": "Execute a shell command on the user's Arch Linux system and return its output. The underlying shell environment runs in zsh. Use when the user asks to check system status, manage files, run scripts, install packages via pacman/yay, or perform any task that requires terminal access. Always prefer specific, minimal commands.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -762,22 +759,116 @@ pub async fn synthesize(
 
     let request = ChatterboxRequest {
         input: text.to_string(),
-        voice: config.chatterbox_voice.clone(),
+        voice: if config.chatterbox_voice.is_empty() {
+            "Andy".to_string()
+        } else {
+            config.chatterbox_voice.clone()
+        },
         model: "chatterbox".to_string(),
     };
 
+    // Ensure URL structure handles slash joins cleanly
+    let base_url = config.chatterbox_url.trim_end_matches('/');
+    let target_url = format!("{}/v1/audio/speech", base_url);
+
     let resp = client
-        .post(format!("{}/v1/audio/speech", config.chatterbox_url))
+        .post(&target_url)
         .json(&request)
         .send()
         .await?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_else(|_| "Unknown empty error body".to_string());
         return Err(format!("Chatterbox API error {}: {}", status, body).into());
     }
 
     let audio_bytes = resp.bytes().await?;
+    
+    if audio_bytes.is_empty() {
+        return Err("Chatterbox returned an empty byte array buffer.".into());
+    }
+
+    // Safely encode binary audio bytes into Base64 for the frontend player
     Ok(STANDARD.encode(&audio_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VoiceConfig;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn test_chatterbox_synthesis() {
+        let config = VoiceConfig::default();
+        println!("Testing Chatterbox TTS at: {}", config.chatterbox_url);
+        println!("Using voice: {}", config.chatterbox_voice);
+        
+        match synthesize(&config, "Hello, I am testing the audio playback. Can you hear me?").await {
+            Ok(base64_audio) => {
+                println!("SUCCESS: Received {} bytes of base64 audio.", base64_audio.len());
+                
+                // Decode back to bytes
+                let audio_bytes = STANDARD.decode(base64_audio).unwrap();
+                
+                // Try to play it
+                println!("Attempting to play audio...");
+                if let Err(e) = play_wav_bytes(audio_bytes) {
+                    println!("Playback failed: {}", e);
+                } else {
+                    println!("Playback finished.");
+                }
+            }
+            Err(e) => {
+                println!("FAILURE: Chatterbox synthesis failed: {}", e);
+            }
+        }
+    }
+
+    fn play_wav_bytes(bytes: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
+        let spec = reader.spec();
+        println!("WAV Spec: {:?}", spec);
+
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or("No output device found")?;
+        let config = device.default_output_config()?;
+
+        // Collect all samples into an Arc<Vec<i16>> to share with the static-lifetime closure
+        let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+        let total_samples = samples.len();
+        let samples = Arc::new(samples);
+        let pos = Arc::new(Mutex::new(0usize));
+
+        let pos_clone = Arc::clone(&pos);
+        let samples_clone = Arc::clone(&samples);
+        
+        let stream = device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut p = pos_clone.lock().unwrap();
+                for sample in data.iter_mut() {
+                    if *p < samples_clone.len() {
+                        *sample = samples_clone[*p] as f32 / 32768.0;
+                        *p += 1;
+                    } else {
+                        *sample = 0.0;
+                    }
+                }
+            },
+            |err| eprintln!("Playback error: {}", err),
+            None,
+        )?;
+
+        stream.play()?;
+        
+        // Wait for audio to finish
+        let duration_secs = (total_samples as f32 / (spec.sample_rate as f32 * spec.channels as f32)) + 0.5;
+        std::thread::sleep(std::time::Duration::from_secs_f32(duration_secs));
+        
+        Ok(())
+    }
 }
