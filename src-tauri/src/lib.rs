@@ -558,17 +558,13 @@ async fn process_pipeline(
             Ok(audio_base64) => {
                 if cancel.is_cancelled() { break; }
                 
-                // In your application logic execution flow:
-                // You MUST feed the base64 string to the player
-                if let Err(err) = voice::play_synthesized_audio(&audio_base64) {
-                    eprintln!("Production audio output error: {}", err);
-                }
-
+                // Send the audio chunk cleanly to the Tauri frontend to play
                 app.emit("play_audio_chunk", AudioChunk {
                     index: sentence_index,
                     audio: audio_base64,
                 })
                 .map_err(|e: tauri::Error| e.to_string())?;
+                
                 sentence_index += 1;
             }
             Err(e) => {
