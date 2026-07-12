@@ -32,25 +32,29 @@ pub fn record_audio(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
         println!("Device {}: {}", i, name);
     }
 
-    // Try to find the device from config, otherwise use our heuristic
+    // Try to find the device from config, otherwise use our fallback logic
     let device = if !config_device_name.is_empty() && config_device_name != "default" {
-        devices.iter().find(|d| d.name().ok() == Some(config_device_name.clone()))
+        // 1. Try to find the exact match from user config
+        devices.iter()
+            .find(|d| d.name().ok() == Some(config_device_name.clone()))
             .cloned()
             .or_else(|| host.default_input_device())
     } else {
-        // Heuristic: look for hardware-like names and avoid virtual/monitor sinks
-        devices.iter().find(|d| {
-            if let Ok(name) = d.name() {
-                let nl = name.to_lowercase();
-                (nl.contains("mic") || nl.contains("input") || nl.contains("usb") || nl.contains("audio") || 
-                 nl.contains("sof") || nl.contains("hda") || nl.contains("card") || nl.contains("hw:"))
-                && !nl.contains("monitor") && !nl.contains("output") && !nl.contains("pipewire") && !nl.contains("pulse")
-            } else {
-                false
-            }
-        })
-        .cloned()
-        .or_else(|| host.default_input_device())
+        // 2. If it's empty, set to "default", or explicitly running on PipeWire, 
+        // trust the session manager's default device choice!
+        host.default_input_device()
+            .or_else(|| {
+                // Heuristic emergency fallback only if no system default is set
+                devices.iter().find(|d| {
+                    if let Ok(name) = d.name() {
+                        let nl = name.to_lowercase();
+                        (nl.contains("mic") || nl.contains("input") || nl.contains("usb") || nl.contains("audio"))
+                        && !nl.contains("monitor") && !nl.contains("output")
+                    } else {
+                        false
+                    }
+                }).cloned()
+            })
     }.ok_or("No suitable input device found.")?;
 
     let name = device.name().unwrap_or_else(|_| "Unknown".into());
