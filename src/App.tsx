@@ -36,6 +36,7 @@ interface VoiceConfig {
   vision_model: string;
   chatterbox_url: string;
   chatterbox_voice: string;
+  chatterbox_model_path: string;
   system_prompt: string;
   input_device: string;
   tools: ToolsConfig;
@@ -119,8 +120,11 @@ function ConfigTab({ config, setConfig }: { config: VoiceConfig; setConfig: (c: 
         <Field label="Chatterbox URL">
           <Input value={config.chatterbox_url} onChange={(v) => setConfig({ ...config, chatterbox_url: v })} />
         </Field>
-        <Field label="Voice">
-          <Input value={config.chatterbox_voice} onChange={(v) => setConfig({ ...config, chatterbox_voice: v })} />
+        <Field label="Voice (Reference Wave)">
+          <Input value={config.chatterbox_voice} onChange={(v) => setConfig({ ...config, chatterbox_voice: v })} placeholder="jarvis.wav" />
+        </Field>
+        <Field label="Chatterbox Model Cache Path">
+          <Input value={config.chatterbox_model_path} onChange={(v) => setConfig({ ...config, chatterbox_model_path: v })} />
         </Field>
       </FieldGroup>
 

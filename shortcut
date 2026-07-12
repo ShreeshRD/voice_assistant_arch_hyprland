@@ -1,0 +1,13 @@
+#!/bin/bash
+# Shortcut to run the Voice Assistant AppImage
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+APPIMAGE_PATH="$APP_DIR/src-tauri/target/release/bundle/appimage/Voice Assistant_0.1.0_amd64.AppImage"
+
+if [ -f "$APPIMAGE_PATH" ]; then
+    chmod +x "$APPIMAGE_PATH"
+    "$APPIMAGE_PATH" "$@"
+else
+    echo "Error: AppImage not found at $APPIMAGE_PATH"
+    echo "Please run 'npm run tauri build' first."
+    exit 1
+fi

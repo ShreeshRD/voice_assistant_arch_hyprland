@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::process::Child;
 use std::sync::Mutex;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -8,6 +9,9 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio_util::sync::CancellationToken;
+
+/// Global handle to the Python TTS server child process.
+static TTS_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
 mod rag;
 mod sandbox;
@@ -97,6 +101,8 @@ pub struct VoiceConfig {
     pub vision_model: String,
     pub chatterbox_url: String,
     pub chatterbox_voice: String,
+    #[serde(default)]
+    pub chatterbox_model_path: String,
     pub system_prompt: String,
     #[serde(default)]
     pub input_device: String,
@@ -115,14 +121,22 @@ impl Default for VoiceConfig {
                     .to_string()
             })
             .unwrap_or_default();
+        let default_chatterbox_model = dirs::home_dir()
+            .map(|h| {
+                h.join(".config/chatterbox-tts")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_default();
         Self {
             whisper_model_path: default_model,
             ollama_url: "http://localhost:11434".to_string(),
-            ollama_model: "qwen3:4b".to_string(),
+            ollama_model: "gemma4:e2b".to_string(),
             embed_model: "nomic-embed-text".to_string(),
             vision_model: "llava".to_string(),
             chatterbox_url: "http://localhost:8005".to_string(),
             chatterbox_voice: "Alice.wav".to_string(),
+            chatterbox_model_path: default_chatterbox_model,
             system_prompt: "You are a voice assistant running on the user's desktop. The conversation happens entirely through voice — the user speaks into their microphone, their speech is transcribed to text via Whisper (STT), sent to you as a message, and your response is converted back to speech via Chatterbox Turbo (TTS) and played through their speakers. You can hear them and they can hear you — treat this as a natural spoken conversation. If they ask \"can you hear me\" the answer is yes.\n\nKeep responses concise and conversational — 2-3 sentences max. No markdown, no code blocks, no bullet points, no numbered lists, no special formatting. Write exactly as you would speak out loud. Avoid colons in your responses as they cause unnatural pauses in TTS.\n\nYou can express emotions naturally using these paralinguistic tags inline with your speech — use them sparingly and only when they genuinely fit the moment:\n[laugh] [chuckle] [sigh] [gasp] [cough] [clear throat] [sniff] [groan] [shush]\nExample — \"Oh wow, that's actually hilarious [laugh] I didn't expect that at all.\"\nDo NOT overuse them. Most responses need zero tags. Only use them when a human would genuinely make that sound.\n\nWhen you decide to use a tool, ALWAYS say what you're about to do first in a short natural sentence before calling the tool. For example — \"Let me take a look at your screen\" before taking a screenshot, \"Let me search the web for that\" before fetching a page, \"Let me check the time\" before getting the time, \"One sec, let me run that command\" before executing a shell command. This way the user hears what's happening instead of waiting in silence.".to_string(),
             input_device: "default".to_string(),
             tools: ToolsConfig::default(),
@@ -209,11 +223,7 @@ fn hide_window(app: tauri::AppHandle) {
 // ── RAG Commands ──
 
 #[tauri::command]
-async fn ingest_text(
-    app: tauri::AppHandle,
-    source: String,
-    text: String,
-) -> Result<usize, String> {
+async fn ingest_text(app: tauri::AppHandle, source: String, text: String) -> Result<usize, String> {
     let state = app.state::<AppState>();
     let config = state.config.lock().unwrap().clone();
     state
@@ -307,7 +317,15 @@ fn stop_recording_and_process(app: tauri::AppHandle) -> Result<(), String> {
     let cancel_token = state.pipeline_cancel.lock().unwrap().clone();
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = process_pipeline(app_handle.clone(), samples, sample_rate, config, cancel_token).await {
+        if let Err(e) = process_pipeline(
+            app_handle.clone(),
+            samples,
+            sample_rate,
+            config,
+            cancel_token,
+        )
+        .await
+        {
             if e != "interrupted" {
                 eprintln!("Pipeline error: {}", e);
                 let _ = app_handle.emit(
@@ -349,7 +367,9 @@ async fn process_pipeline(
     .map_err(|e| format!("Transcription task failed: {}", e))?
     .map_err(|e| format!("Transcription failed: {}", e))?;
 
-    if cancel.is_cancelled() { return Err("interrupted".to_string()); }
+    if cancel.is_cancelled() {
+        return Err("interrupted".to_string());
+    }
 
     if transcript.trim().is_empty() {
         app.emit(
@@ -374,11 +394,15 @@ async fn process_pipeline(
 
     // Add user message
     {
-        app.state::<AppState>().messages.lock().unwrap().push(ChatMessage {
-            role: "user".to_string(),
-            content: transcript.clone(),
-            tool_calls: None,
-        });
+        app.state::<AppState>()
+            .messages
+            .lock()
+            .unwrap()
+            .push(ChatMessage {
+                role: "user".to_string(),
+                content: transcript.clone(),
+                tool_calls: None,
+            });
     }
 
     // Stage 2: LLM with tool calling → streaming TTS
@@ -391,7 +415,18 @@ async fn process_pipeline(
     )
     .map_err(|e: tauri::Error| e.to_string())?;
 
-    let all_messages = app.state::<AppState>().messages.lock().unwrap().clone();
+    // Trim history to the last 10 messages to avoid GGML_SCHED_MAX_SPLIT_INPUTS
+    // overflow — the tools schema + system prompt + long history exhausts llama.cpp's
+    // scheduler input budget, causing a hard crash in the llama-server process.
+    let all_messages = {
+        let msgs = app.state::<AppState>().messages.lock().unwrap().clone();
+        let max_history = 10;
+        if msgs.len() > max_history {
+            msgs[msgs.len() - max_history..].to_vec()
+        } else {
+            msgs
+        }
+    };
 
     let tools = voice::build_tools(&config.tools);
     let max_tool_rounds = 5;
@@ -416,7 +451,9 @@ async fn process_pipeline(
             let mut all_msgs = all_messages;
 
             for _round in 0..max_tool_rounds {
-                if cancel_llm.is_cancelled() { return Err("interrupted".to_string()); }
+                if cancel_llm.is_cancelled() {
+                    return Err("interrupted".to_string());
+                }
 
                 let result = tokio::select! {
                     _ = cancel_llm.cancelled() => { return Err("interrupted".to_string()); }
@@ -430,7 +467,9 @@ async fn process_pipeline(
                         return Ok::<String, String>(text);
                     }
                     voice::StreamResult::ToolCalls(tool_calls, preamble, xml_parsed) => {
-                        if cancel_llm.is_cancelled() { return Err("interrupted".to_string()); }
+                        if cancel_llm.is_cancelled() {
+                            return Err("interrupted".to_string());
+                        }
 
                         if xml_parsed {
                             // XML-parsed tool calls: model emitted XML as text.
@@ -447,7 +486,9 @@ async fn process_pipeline(
 
                             let mut tool_results = String::new();
                             for tool_call in &tool_calls {
-                                if cancel_llm.is_cancelled() { return Err("interrupted".to_string()); }
+                                if cancel_llm.is_cancelled() {
+                                    return Err("interrupted".to_string());
+                                }
 
                                 let _ = app.emit(
                                     "processing",
@@ -483,7 +524,9 @@ async fn process_pipeline(
                             });
 
                             for tool_call in &tool_calls {
-                                if cancel_llm.is_cancelled() { return Err("interrupted".to_string()); }
+                                if cancel_llm.is_cancelled() {
+                                    return Err("interrupted".to_string());
+                                }
 
                                 let _ = app.emit(
                                     "processing",
@@ -515,7 +558,9 @@ async fn process_pipeline(
             }
 
             // Hit max rounds — do one final stream without tools
-            if cancel_llm.is_cancelled() { return Err("interrupted".to_string()); }
+            if cancel_llm.is_cancelled() {
+                return Err("interrupted".to_string());
+            }
 
             let result = voice::chat_streaming(&config, &all_msgs, &[], &sentence_tx)
                 .await
@@ -523,7 +568,9 @@ async fn process_pipeline(
 
             match result {
                 voice::StreamResult::Content(text) => Ok(text),
-                voice::StreamResult::ToolCalls(_, _, _) => Err("Model returned tool calls after max rounds".to_string()),
+                voice::StreamResult::ToolCalls(_, _, _) => {
+                    Err("Model returned tool calls after max rounds".to_string())
+                }
             }
         })
     };
@@ -534,7 +581,9 @@ async fn process_pipeline(
     // Process sentences as they arrive from the stream → TTS → audio
     // Check cancellation between each TTS synthesis
     while let Some(sentence) = sentence_rx.recv().await {
-        if cancel.is_cancelled() { break; }
+        if cancel.is_cancelled() {
+            break;
+        }
 
         full_text.push_str(&sentence);
         full_text.push(' ');
@@ -556,15 +605,20 @@ async fn process_pipeline(
 
         match tts_result {
             Ok(audio_base64) => {
-                if cancel.is_cancelled() { break; }
-                
+                if cancel.is_cancelled() {
+                    break;
+                }
+
                 // Send the audio chunk cleanly to the Tauri frontend to play
-                app.emit("play_audio_chunk", AudioChunk {
-                    index: sentence_index,
-                    audio: audio_base64,
-                })
+                app.emit(
+                    "play_audio_chunk",
+                    AudioChunk {
+                        index: sentence_index,
+                        audio: audio_base64,
+                    },
+                )
                 .map_err(|e: tauri::Error| e.to_string())?;
-                
+
                 sentence_index += 1;
             }
             Err(e) => {
@@ -587,11 +641,15 @@ async fn process_pipeline(
         .map_err(|e: tauri::Error| e.to_string())?;
 
     // Add assistant message to history
-    app.state::<AppState>().messages.lock().unwrap().push(ChatMessage {
-        role: "assistant".to_string(),
-        content: full_response,
-        tool_calls: None,
-    });
+    app.state::<AppState>()
+        .messages
+        .lock()
+        .unwrap()
+        .push(ChatMessage {
+            role: "assistant".to_string(),
+            content: full_response,
+            tool_calls: None,
+        });
 
     Ok(())
 }
@@ -606,8 +664,13 @@ async fn execute_tool(
 
     match tool_call.function.name.as_str() {
         "search_knowledge" => {
-            let query = tool_call.function.arguments.get("query")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let query = tool_call
+                .function
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             let results = rag_store
                 .search(&query, &config.ollama_url, &config.embed_model, 5)
@@ -617,24 +680,44 @@ async fn execute_tool(
             if results.is_empty() {
                 "No relevant results found in the knowledge base.".to_string()
             } else {
-                results.iter().enumerate()
-                    .map(|(i, r)| format!("[{}] (source: {}, relevance: {:.2})\n{}", i + 1, r.source, r.score, r.text))
+                results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        format!(
+                            "[{}] (source: {}, relevance: {:.2})\n{}",
+                            i + 1,
+                            r.source,
+                            r.score,
+                            r.text
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n\n")
             }
         }
         "take_screenshot" => {
-            let question = tool_call.function.arguments.get("question")
+            let question = tool_call
+                .function
+                .arguments
+                .get("question")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Describe what you see on this screen in detail.")
                 .to_string();
-            let monitor = tool_call.function.arguments.get("monitor")
-                .and_then(|v| v.as_u64()).map(|n| n as u32);
+            let monitor = tool_call
+                .function
+                .arguments
+                .get("monitor")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
 
-            let _ = app.emit("processing", ProcessingState {
-                stage: "thinking".to_string(),
-                text: "Looking at your screen...".to_string(),
-            });
+            let _ = app.emit(
+                "processing",
+                ProcessingState {
+                    stage: "thinking".to_string(),
+                    text: "Looking at your screen...".to_string(),
+                },
+            );
 
             match tools::take_screenshot(monitor) {
                 Ok(image_b64) => {
@@ -652,14 +735,31 @@ async fn execute_tool(
             }
         }
         "read_clipboard" => match tools::read_clipboard() {
-            Ok(text) => if text.trim().is_empty() { "The clipboard is empty.".to_string() } else { format!("Clipboard contents:\n{}", text) },
+            Ok(text) => {
+                if text.trim().is_empty() {
+                    "The clipboard is empty.".to_string()
+                } else {
+                    format!("Clipboard contents:\n{}", text)
+                }
+            }
             Err(e) => format!("Failed to read clipboard: {}", e),
         },
         "open_url" => {
-            let url = tool_call.function.arguments.get("url")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if url.is_empty() { "No URL provided.".to_string() }
-            else { match tools::open_url(&url) { Ok(msg) => msg, Err(e) => format!("Failed to open URL: {}", e) } }
+            let url = tool_call
+                .function
+                .arguments
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                "No URL provided.".to_string()
+            } else {
+                match tools::open_url(&url) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("Failed to open URL: {}", e),
+                }
+            }
         }
         "get_current_time" => tools::get_current_time(),
         "list_running_apps" => match tools::list_running_apps() {
@@ -667,21 +767,40 @@ async fn execute_tool(
             Err(e) => format!("Failed to list apps: {}", e),
         },
         "web_fetch" => {
-            let url = tool_call.function.arguments.get("url")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-            if url.is_empty() { "No URL provided.".to_string() }
-            else { match tools::web_fetch(&url).await { Ok(text) => text, Err(e) => format!("Failed to fetch {}: {}", url, e) } }
+            let url = tool_call
+                .function
+                .arguments
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                "No URL provided.".to_string()
+            } else {
+                match tools::web_fetch(&url).await {
+                    Ok(text) => text,
+                    Err(e) => format!("Failed to fetch {}: {}", url, e),
+                }
+            }
         }
         "run_command" => {
-            let command = tool_call.function.arguments.get("command")
-                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let command = tool_call
+                .function
+                .arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if command.is_empty() {
                 "No command provided.".to_string()
             } else {
-                let _ = app.emit("processing", ProcessingState {
-                    stage: "thinking".to_string(),
-                    text: format!("Running: {}", command),
-                });
+                let _ = app.emit(
+                    "processing",
+                    ProcessingState {
+                        stage: "thinking".to_string(),
+                        text: format!("Running: {}", command),
+                    },
+                );
                 let audit = &app.state::<AppState>().audit_log;
                 match sandbox::execute(&command, &config.sandbox, audit) {
                     Ok(output) => output,
@@ -776,6 +895,9 @@ pub fn run() {
                             let mut cancel = state.pipeline_cancel.lock().unwrap();
                             cancel.cancel(); // signal the running pipeline to stop
                             *cancel = CancellationToken::new(); // fresh token for next pipeline
+                            // Also reset the recording flag — a previous pipeline interrupted
+                            // mid-recording may leave is_recording=true, blocking a new session.
+                            *state.is_recording.lock().unwrap() = false;
                         }
 
                         // Tell frontend to stop audio and reset
@@ -802,19 +924,16 @@ pub fn run() {
                         }
                         let _ = app.emit("hotkey_pressed", ());
 
-                        // Start recording
+                        // Start recording — is_recording was reset above so this always fires
                         let state = app.state::<AppState>();
-                        let is_rec = *state.is_recording.lock().unwrap();
-                        if !is_rec {
-                            state.recorded_samples.lock().unwrap().clear();
-                            *state.is_recording.lock().unwrap() = true;
-                            let app_clone = app.clone();
-                            std::thread::spawn(move || {
-                                if let Err(e) = voice::record_audio(&app_clone) {
-                                    eprintln!("Recording error: {}", e);
-                                }
-                            });
-                        }
+                        state.recorded_samples.lock().unwrap().clear();
+                        *state.is_recording.lock().unwrap() = true;
+                        let app_clone = app.clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = voice::record_audio(&app_clone) {
+                                eprintln!("Recording error: {}", e);
+                            }
+                        });
                     }
                     ShortcutState::Released => {
                         let _ = app.emit("hotkey_released", ());
@@ -879,6 +998,53 @@ pub fn run() {
                 let _ = window.hide();
             }
 
+            // ── Spawn offline TTS server ─────────────────────────────────
+            // Locate tts_server.py relative to the Tauri binary so the path
+            // resolves correctly in both `cargo tauri dev` and release builds.
+            let tts_script = app
+                .path()
+                .resource_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("src/tts_server.py");
+
+            // Fallback: resolve from the manifest directory (dev mode)
+            let tts_script = if tts_script.exists() {
+                tts_script
+            } else {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/tts_server.py")
+            };
+
+            if tts_script.exists() {
+                let voice_arg = app.state::<AppState>()
+                    .config
+                    .lock()
+                    .unwrap()
+                    .chatterbox_voice
+                    .clone();
+
+                match std::process::Command::new("/home/arch/.pyenv/versions/voice/bin/python")
+                    .arg(&tts_script)
+                    .arg("--voice")
+                    .arg(&voice_arg)
+                    .spawn()
+                {
+                    Ok(child) => {
+                        println!(
+                            "[TTS] Python TTS server started (pid {}) with voice '{}'",
+                            child.id(),
+                            voice_arg
+                        );
+                        *TTS_PROCESS.lock().unwrap() = Some(child);
+                    }
+                    Err(e) => {
+                        eprintln!("[TTS] Failed to start Python TTS server: {}", e);
+                    }
+                }
+            } else {
+                eprintln!("[TTS] tts_server.py not found at {:?}; TTS will use the existing service on :8005", tts_script);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -896,6 +1062,26 @@ pub fn run() {
             start_recording,
             stop_recording_and_process,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                kill_tts_server();
+            }
+        });
+}
+
+/// Kill the TTS child process on application exit.
+/// Called from the Tauri RunEvent::Exit handler registered in `run()`.
+fn kill_tts_server() {
+    if let Ok(mut guard) = TTS_PROCESS.lock() {
+        if let Some(child) = guard.as_mut() {
+            let pid = child.id();
+            match child.kill() {
+                Ok(_) => println!("[TTS] Python TTS server (pid {}) terminated.", pid),
+                Err(e) => eprintln!("[TTS] Failed to kill TTS server (pid {}): {}", pid, e),
+            }
+        }
+        *guard = None;
+    }
 }
